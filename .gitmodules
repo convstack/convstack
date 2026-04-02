@@ -1,0 +1,6 @@
+[submodule "lanyard"]
+	path = lanyard
+	url = https://github.com/convstack/lanyard.git
+[submodule "dashboard"]
+	path = dashboard
+	url = https://github.com/convstack/dashboard.git
