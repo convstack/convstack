@@ -4,6 +4,10 @@ on:
   repository_dispatch:
     types: [submodule-update]
 
+concurrency:
+  group: update-submodules
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -26,6 +30,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No submodule changes to commit"
           else
+            git pull --rebase
             git commit -m "chore: update ${{ github.event.client_payload.repo }} submodule ref"
             git push
           fi
