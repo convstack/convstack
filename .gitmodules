@@ -4,3 +4,6 @@
 [submodule "dashboard"]
 	path = dashboard
 	url = https://github.com/convstack/dashboard.git
+[submodule "guidebook"]
+	path = guidebook
+	url = https://github.com/convstack/guidebook.git
