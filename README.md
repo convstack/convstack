@@ -11,6 +11,7 @@ Umbrella repository for the Convention Apps platform. This repo contains git sub
 |---|---|
 | [lanyard](lanyard/) | Identity provider, OIDC server, and service catalog |
 | [dashboard](dashboard/) | Auto-discovering dynamic UI shell |
+| [guidebook](guidebook/) | Convention guide and documentation |
 
 ## Clone with submodules
 
