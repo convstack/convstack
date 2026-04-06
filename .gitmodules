@@ -7,3 +7,6 @@
 [submodule "guidebook"]
 	path = guidebook
 	url = https://github.com/convstack/guidebook.git
+[submodule "ledger"]
+	path = ledger
+	url = https://github.com/convstack/ledger.git
