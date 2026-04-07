@@ -9,10 +9,10 @@ Umbrella repository for the Convention Apps platform. This repo contains git sub
 
 | Service | Description |
 |---|---|
-| [lanyard](lanyard/) | Identity provider, OIDC/OAuth2 server, and service catalog |
-| [dashboard](dashboard/) | Auto-discovering dynamic UI shell |
-| [guidebook](guidebook/) | Convention guide and documentation |
-| [ledger](ledger/) | Invoicing and Billing service |
+| [lanyard](../../../lanyard/) | Identity provider, OIDC/OAuth2 server, and service catalog |
+| [dashboard](../../../dashboard/) | Auto-discovering dynamic UI shell |
+| [guidebook](../../../guidebook/) | Convention guide and documentation |
+| [ledger](../../../ledger/) | Invoicing and Billing service |
 
 ## Clone with submodules
 
