@@ -10,3 +10,9 @@
 [submodule "ledger"]
 	path = ledger
 	url = https://github.com/convstack/ledger.git
+[submodule "schedule"]
+	path = schedule
+	url = https://github.com/convstack/schedule.git
+[submodule "service-sdk"]
+	path = service-sdk
+	url = https://github.com/convstack/service-sdk.git
