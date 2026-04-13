@@ -12,7 +12,14 @@ Umbrella repository for the Convention Apps platform. This repo contains git sub
 | [lanyard](../../../lanyard/) | Identity provider, OIDC/OAuth2 server, and service catalog |
 | [dashboard](../../../dashboard/) | Auto-discovering dynamic UI shell |
 | [guidebook](../../../guidebook/) | Convention guide and documentation |
-| [ledger](../../../ledger/) | Invoicing and Billing service |
+| [ledger](../../../ledger/) | Invoicing and billing service |
+| [schedule](../../../schedule/) | Scheduling, shifts, approvals, and kanban boards |
+
+## Shared libraries
+
+| Package | Description |
+|---|---|
+| [service-sdk](../../../service-sdk/) | `@convstack/service-sdk` — shared manifest schemas, handlers, permissions, and dev tooling consumed by every service |
 
 ## Clone with submodules
 
