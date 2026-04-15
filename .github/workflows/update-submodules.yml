@@ -4,6 +4,9 @@ on:
   repository_dispatch:
     types: [submodule-update]
 
+permissions:
+  contents: read
+
 concurrency:
   group: update-submodules
   cancel-in-progress: false
