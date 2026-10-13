@@ -41,6 +41,23 @@ git submodule update --init --recursive
 git submodule update --remote --merge
 ```
 
+## Run the whole stack locally
+
+Give each clone a `.env` copied from its `.env.example`, then start the pieces in this order, each from its own clone:
+
+1. lanyard: `bun run db:migrate`, then `bun run dev` (port 3000). Each `docker compose up` in `deploy/authentik` sends it a full user sync.
+2. Authentik: `docker compose up -d --build` in `deploy/authentik` (port 9000, see its README).
+3. dashboard: set `SESSION_SECRET` in its `.env` (for example from `openssl rand -base64 48`; the example value is refused), then `bun run dev` (port 4000).
+4. guidebook, ledger and schedule: `bun run db:migrate`, then `bun --bun run dev` (ports 5000, 5002 and 5050). Plain `bun run dev` fails on Node 24, which won't load the service SDK's TypeScript from `node_modules`.
+
+Values that must match: the dashboard's `DASHBOARD_CLIENT_ID` and `DASHBOARD_CLIENT_SECRET` against Authentik's `CONVSTACK_CLIENT_ID` and `CONVSTACK_CLIENT_SECRET` (the client id is also lanyard's `IDP_AUDIENCE`), and lanyard's `IDP_API_TOKEN` and `IDP_SCIM_TOKEN` against Authentik's `LANYARD_API_TOKEN` and `LANYARD_SCIM_TOKEN`.
+
+Sign in once with Authentik's bootstrap account (`AUTHENTIK_BOOTSTRAP_EMAIL`), run `bun run lanyard:setup <that email>` in lanyard to make it admin, then register guidebook, ledger and schedule under Lanyard Admin, Services, with health check path `/api/health`, and put each key into that service's `LANYARD_SERVICE_KEY`. Restart each service after its key is in `.env`, since it reads the key and sends its pages to lanyard at start. Being lanyard admin grants no access to the services. Access comes from departments: create one under Lanyard Admin, Departments, add people, then map its roles to each service's permissions with Manage Permissions on that service under Lanyard Admin, Services. People can also sign up themselves once Authentik's `.env` has a mail host (`AUTHENTIK_EMAIL__HOST`, see its README); without one the login screen offers no sign-up or password reset. The dashboard has no login page of its own: `/login` goes straight to Authentik's sign-in screen, whose look is described in Authentik's README.
+
+Open `http://localhost:4000`, not `127.0.0.1:4000`: sign-in state and the proxy's origin check are per origin.
+
+To run lanyard and the dashboard from `dashboard/deploy/docker` instead, stop their dev servers first: the compose publishes ports 3000 and 4000. It needs five values, best written to `dashboard/deploy/docker/.env`, which compose reads by itself and git ignores, since every later compose command there (`exec`, `down`) needs them too: `SESSION_SECRET` (at least 32 random characters), `DB_PASSWORD` (for its own Postgres; keep it URL-safe, for example from `openssl rand -hex 24`), `DASHBOARD_CLIENT_SECRET` (Authentik's `CONVSTACK_CLIENT_SECRET`), and `IDP_API_TOKEN` and `IDP_SCIM_TOKEN` (Authentik's `LANYARD_API_TOKEN` and `LANYARD_SCIM_TOKEN`). Then run `docker compose up -d --build` there. The compose brings its own lanyard with its own Postgres, which starts with no users and keeps the password it was created with, so after changing `DB_PASSWORD` run `docker compose down` and `docker volume rm convstack-dashboard_pgdata` first. After signing in once, make yourself admin there with `docker compose exec lanyard bun run lanyard:setup <email>`. Register the services in that lanyard at `http://host.docker.internal:<port>`, put its keys in their `.env` files and restart them with their production server (`bun --bun run build`, then `bun run start`), which listens on all interfaces; the dev server only answers on localhost.
+
 ---
 
 Made and maintained with 🧡 by [Headpat](https://headpat.space)

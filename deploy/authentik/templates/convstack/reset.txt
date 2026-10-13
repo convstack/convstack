@@ -1,0 +1,10 @@
+{% autoescape off %}Reset your password
+
+A password reset was requested for your account. Open the link below to choose a new password.
+
+{{ url }}
+
+The link works once and for {{ expires|timeuntil }}.
+
+If you did not ask for this, ignore this mail. Your password stays as it is.
+{% endautoescape %}

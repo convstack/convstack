@@ -1,0 +1,124 @@
+services:
+  postgresql:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 5s
+    volumes:
+      - authentik-db:/var/lib/postgresql
+    environment:
+      POSTGRES_PASSWORD: ${PG_PASS}
+      POSTGRES_USER: authentik
+      POSTGRES_DB: authentik
+
+  server:
+    build: .
+    image: convstack-authentik:2026.8.1
+    restart: unless-stopped
+    command: server
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}
+      CONVSTACK_CLIENT_ID: ${CONVSTACK_CLIENT_ID}
+      CONVSTACK_CLIENT_SECRET: ${CONVSTACK_CLIENT_SECRET}
+      DASHBOARD_URL: ${DASHBOARD_URL}
+      DASHBOARD_INTERNAL_URL: ${DASHBOARD_INTERNAL_URL}
+      LANYARD_API_TOKEN: ${LANYARD_API_TOKEN}
+      LANYARD_SCIM_URL: ${LANYARD_SCIM_URL}
+      LANYARD_SCIM_TOKEN: ${LANYARD_SCIM_TOKEN}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      AUTHENTIK_EMAIL__HOST: ${AUTHENTIK_EMAIL__HOST:-}
+      AUTHENTIK_EMAIL__PORT: ${AUTHENTIK_EMAIL__PORT:-25}
+      AUTHENTIK_EMAIL__USERNAME: ${AUTHENTIK_EMAIL__USERNAME:-}
+      AUTHENTIK_EMAIL__PASSWORD: ${AUTHENTIK_EMAIL__PASSWORD:-}
+      AUTHENTIK_EMAIL__USE_TLS: ${AUTHENTIK_EMAIL__USE_TLS:-false}
+      AUTHENTIK_EMAIL__USE_SSL: ${AUTHENTIK_EMAIL__USE_SSL:-false}
+      AUTHENTIK_EMAIL__FROM: ${AUTHENTIK_EMAIL__FROM:-convstack@localhost}
+      TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
+    volumes:
+      - authentik-media:/media
+    ports:
+      - "9000:9000"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+
+  worker:
+    build: .
+    image: convstack-authentik:2026.8.1
+    restart: unless-stopped
+    command: worker
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+      CONVSTACK_CLIENT_ID: ${CONVSTACK_CLIENT_ID}
+      CONVSTACK_CLIENT_SECRET: ${CONVSTACK_CLIENT_SECRET}
+      DASHBOARD_URL: ${DASHBOARD_URL}
+      DASHBOARD_INTERNAL_URL: ${DASHBOARD_INTERNAL_URL}
+      LANYARD_API_TOKEN: ${LANYARD_API_TOKEN}
+      LANYARD_SCIM_URL: ${LANYARD_SCIM_URL}
+      LANYARD_SCIM_TOKEN: ${LANYARD_SCIM_TOKEN}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      AUTHENTIK_EMAIL__HOST: ${AUTHENTIK_EMAIL__HOST:-}
+      AUTHENTIK_EMAIL__PORT: ${AUTHENTIK_EMAIL__PORT:-25}
+      AUTHENTIK_EMAIL__USERNAME: ${AUTHENTIK_EMAIL__USERNAME:-}
+      AUTHENTIK_EMAIL__PASSWORD: ${AUTHENTIK_EMAIL__PASSWORD:-}
+      AUTHENTIK_EMAIL__USE_TLS: ${AUTHENTIK_EMAIL__USE_TLS:-false}
+      AUTHENTIK_EMAIL__USE_SSL: ${AUTHENTIK_EMAIL__USE_SSL:-false}
+      AUTHENTIK_EMAIL__FROM: ${AUTHENTIK_EMAIL__FROM:-convstack@localhost}
+      TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - authentik-media:/media
+    depends_on:
+      postgresql:
+        condition: service_healthy
+
+  avatar-init:
+    build: .
+    image: convstack-authentik:2026.8.1
+    restart: "no"
+    command: ["shell", "-c", "import runpy; runpy.run_path('/avatar-init/set-avatars.py', run_name='__main__')"]
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+      AUTHENTIK_AVATARS: ${AUTHENTIK_AVATARS}
+      LANYARD_SCIM_URL: ${LANYARD_SCIM_URL}
+      LANYARD_SCIM_TOKEN: ${LANYARD_SCIM_TOKEN}
+    depends_on:
+      server:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+
+volumes:
+  authentik-db:
+  authentik-media:

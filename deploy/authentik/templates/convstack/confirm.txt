@@ -1,0 +1,10 @@
+{% autoescape off %}Confirm your email address
+
+Someone signed up with this address. If that was you, open the link below to confirm it and choose a password.
+
+{{ url }}
+
+The link works once and for {{ expires|timeuntil }}.
+
+If you did not sign up, ignore this mail. Without the link nothing happens.
+{% endautoescape %}

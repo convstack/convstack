@@ -1,0 +1,1409 @@
+version: 1
+metadata:
+  name: convstack
+context:
+  client_id: !Env [CONVSTACK_CLIENT_ID, convstack-dashboard]
+  client_secret: !Env [CONVSTACK_CLIENT_SECRET, ""]
+  dashboard_url: !Env [DASHBOARD_URL, "http://localhost:4000"]
+  dashboard_internal_url: !Env [DASHBOARD_INTERNAL_URL, "http://host.docker.internal:4000"]
+  lanyard_api_token: !Env [LANYARD_API_TOKEN, ""]
+  lanyard_scim_url: !Env [LANYARD_SCIM_URL, "http://host.docker.internal:3000/scim/v2"]
+  lanyard_scim_token: !Env [LANYARD_SCIM_TOKEN, ""]
+entries:
+  # our entries edit Authentik's default flows and stages, which its own
+  # blueprints create as separate tasks on an empty volume
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Authentication flow
+      required: false
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Source authentication flow
+      required: false
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Source enrollment flow
+      required: false
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Provider authorization flow (explicit consent)
+      required: false
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Invalidation flow
+      required: false
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Provider authorization flow (implicit consent)
+      required: false
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Provider invalidation flow
+      required: false
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Source pre-authentication flow
+      required: false
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Password change flow
+      required: false
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Static MFA setup flow
+      required: false
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - TOTP MFA setup flow
+      required: false
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - WebAuthn MFA setup flow
+      required: false
+
+  - model: authentik_providers_oauth2.scopemapping
+    id: convstack-lanyard-user-id-mapping
+    identifiers:
+      name: "ConvStack: Lanyard User ID"
+    attrs:
+      scope_name: profile
+      expression: |
+        return {"ak_user_id": request.user.pk}
+
+  - model: authentik_providers_oauth2.oauth2provider
+    id: convstack-provider
+    identifiers:
+      name: ConvStack Dashboard
+    attrs:
+      client_type: confidential
+      client_id: !Context client_id
+      client_secret: !Context client_secret
+      signing_key: !Find [authentik_crypto.certificatekeypair, [name, authentik Self-signed Certificate]]
+      grant_types:
+        - authorization_code
+        - refresh_token
+      access_code_validity: minutes=1
+      access_token_validity: minutes=5
+      refresh_token_validity: days=30
+      sub_mode: hashed_user_id
+      include_claims_in_id_token: true
+      # the worker sends this, so it must be reachable from inside the container
+      logout_uri: !Format ["%s/api/auth/backchannel-logout", !Context dashboard_internal_url]
+      logout_method: backchannel
+      redirect_uris:
+        - matching_mode: strict
+          url: !Format ["%s/callback", !Context dashboard_url]
+        - matching_mode: strict
+          url: !Format ["%s/login", !Context dashboard_url]
+          redirect_uri_type: logout
+      authorization_flow:
+        !Find [authentik_flows.flow, [slug, default-provider-authorization-explicit-consent]]
+      # ends the Authentik session too, so a shared computer is left signed out
+      invalidation_flow:
+        !Find [authentik_flows.flow, [slug, default-invalidation-flow]]
+      # managed, not scope_name: our own mapping below also has scope_name
+      # profile, and scope_name isn't unique, so !Find on it can match our
+      # mapping instead of the system default and never attach the default.
+      property_mappings:
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, "goauthentik.io/providers/oauth2/scope-openid"]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, "goauthentik.io/providers/oauth2/scope-profile"]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, "goauthentik.io/providers/oauth2/scope-email"]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, "goauthentik.io/providers/oauth2/scope-offline_access"]]
+        - !KeyOf convstack-lanyard-user-id-mapping
+
+  - model: authentik_policies_expression.expressionpolicy
+    id: convstack-require-pkce
+    identifiers:
+      name: convstack-require-pkce
+    attrs:
+      execution_logging: true
+      expression: |
+        # oauth_code_challenge is only present in context for the authorize
+        # flow; other evaluations (e.g. the user application library) carry
+        # no PKCE context and must pass through.
+        if "oauth_code_challenge" not in request.context:
+            return True
+        if not request.context.get("oauth_code_challenge"):
+            ak_message("PKCE is required.")
+            return False
+        if request.context.get("oauth_code_challenge_method") != "S256":
+            ak_message("PKCE method must be S256.")
+            return False
+        return True
+
+  - model: authentik_providers_scim.scimmapping
+    id: convstack-scim-user-mapping
+    identifiers:
+      name: "ConvStack: Lanyard SCIM User"
+    attrs:
+      expression: |
+        # lanyard keys the row on externalId (the OIDC sub, filled in by
+        # Authentik) and needs the pk to address the user in Authentik's API
+        if not request.user.email:
+            # lanyard stores no user without an email
+            raise SkipObject
+        user = request.user
+        # a sign-up nobody confirmed is not a person yet. last_login keeps a
+        # real account that an admin deactivates later out of this rule
+        if not user.is_active and user.last_login is None and user.attributes.get("convstack_pending"):
+            raise SkipObject
+        avatar = request.user.avatar
+        return {
+            "userName": request.user.username,
+            "displayName": request.user.name,
+            "active": request.user.is_active,
+            "emails": [{"value": request.user.email, "type": "other", "primary": True}],
+            "photos": [{"value": avatar, "type": "photo"}] if "://" in avatar else None,
+            "schemas": ["urn:ietf:params:scim:schemas:extension:convstack:2.0:User"],
+            "urn:ietf:params:scim:schemas:extension:convstack:2.0:User": {"akUserId": request.user.pk},
+        }
+
+  - model: authentik_providers_scim.scimmapping
+    id: convstack-scim-skip-groups
+    identifiers:
+      name: "ConvStack: Skip SCIM Groups"
+    attrs:
+      expression: |
+        # departments live in lanyard, which has no Groups endpoint
+        raise SkipObject
+
+  - model: authentik_providers_scim.scimprovider
+    id: lanyard-scim-provider
+    identifiers:
+      name: ConvStack Lanyard SCIM
+    attrs:
+      url: !Context lanyard_scim_url
+      token: !Context lanyard_scim_token
+      auth_mode: token
+      compatibility_mode: default
+      exclude_users_service_account: true
+      discovery_enabled: false
+      property_mappings:
+        - !KeyOf convstack-scim-user-mapping
+      property_mappings_group:
+        - !KeyOf convstack-scim-skip-groups
+
+  - model: authentik_core.application
+    id: convstack-app
+    identifiers:
+      slug: convstack
+    attrs:
+      name: ConvStack
+      provider: !KeyOf convstack-provider
+      backchannel_providers:
+        - !KeyOf lanyard-scim-provider
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf convstack-app
+      order: 0
+    attrs:
+      policy: !KeyOf convstack-require-pkce
+      enabled: true
+
+  - model: authentik_rbac.role
+    id: lanyard-service-role
+    identifiers:
+      name: ConvStack Lanyard Service
+    attrs:
+      permissions:
+        - authentik_core.view_user
+        - authentik_core.change_user
+        - authentik_core.add_user
+        - authentik_core.delete_user
+
+  - model: authentik_core.user
+    id: lanyard-service-account
+    identifiers:
+      username: lanyard-service
+    attrs:
+      name: Lanyard Service Account
+      type: service_account
+      roles:
+        - !KeyOf lanyard-service-role
+
+  - model: authentik_core.token
+    id: lanyard-api-token
+    identifiers:
+      identifier: lanyard-api-token
+      intent: api
+      expiring: false
+      user: !KeyOf lanyard-service-account
+    attrs:
+      key: !Context lanyard_api_token
+
+  # The Dockerfile drops the default blueprints that create these; this removes
+  # them from instances that were set up before that.
+  - model: authentik_core.group
+    state: absent
+    identifiers:
+      name: authentik Read-only
+
+  - model: authentik_rbac.role
+    state: absent
+    identifiers:
+      name: authentik Read-only
+
+  - model: authentik_core.group
+    state: absent
+    identifiers:
+      name: authentik Agent-Users
+
+  - model: authentik_rbac.role
+    state: absent
+    identifiers:
+      name: authentik Agent-Users
+
+  # avatar-init used to hold an API token; absent so existing installs drop it
+  - model: authentik_core.token
+    state: absent
+    identifiers:
+      identifier: avatar-init-api-token
+
+  - model: authentik_core.user
+    state: absent
+    identifiers:
+      username: avatar-init-service
+
+  - model: authentik_rbac.role
+    state: absent
+    identifiers:
+      name: ConvStack Avatar Init
+
+  # providers can hand out addresses they never verified; without an email,
+  # email_deny refuses the sign-in instead of enrolling. The verified address
+  # is the username too, so a sign-up can't pose as another account
+  - model: authentik_sources_oauth.oauthsourcepropertymapping
+    id: discord-verified-email
+    identifiers:
+      name: "ConvStack: Discord verified email"
+    attrs:
+      expression: |
+        return {"username": info.get("email")} if info.get("verified") else {"email": None}
+
+  - model: authentik_sources_oauth.oauthsourcepropertymapping
+    id: google-verified-email
+    identifiers:
+      name: "ConvStack: Google verified email"
+    attrs:
+      expression: |
+        return {"username": info.get("email")} if info.get("verified_email") else {"email": None}
+
+  - model: authentik_sources_oauth.oauthsourcepropertymapping
+    id: github-verified-email
+    identifiers:
+      name: "ConvStack: GitHub verified email"
+    attrs:
+      expression: |
+        verified = [e.get("email") for e in client.get_github_emails(token) if e.get("verified")]
+        email = properties.get("email")
+        return {"username": email} if email in verified else {"email": None}
+
+  - model: authentik_sources_oauth.oauthsource
+    id: discord-source
+    identifiers:
+      slug: discord
+    attrs:
+      name: Discord
+      provider_type: discord
+      # a source without credentials stays off the login page; "unset" only
+      # keeps Authentik's required credential fields non-blank
+      enabled: !Condition [AND, !Env DISCORD_CLIENT_ID, !Env DISCORD_CLIENT_SECRET]
+      consumer_key: !Env [DISCORD_CLIENT_ID, unset]
+      consumer_secret: !Env [DISCORD_CLIENT_SECRET, unset]
+      user_matching_mode: email_deny
+      authentication_flow: !Find [authentik_flows.flow, [slug, default-source-authentication]]
+      enrollment_flow: !Find [authentik_flows.flow, [slug, default-source-enrollment]]
+      user_property_mappings:
+        - !KeyOf discord-verified-email
+
+  - model: authentik_sources_oauth.oauthsource
+    id: google-source
+    identifiers:
+      slug: google
+    attrs:
+      name: Google
+      provider_type: google
+      enabled: !Condition [AND, !Env GOOGLE_CLIENT_ID, !Env GOOGLE_CLIENT_SECRET]
+      consumer_key: !Env [GOOGLE_CLIENT_ID, unset]
+      consumer_secret: !Env [GOOGLE_CLIENT_SECRET, unset]
+      user_matching_mode: email_deny
+      authentication_flow: !Find [authentik_flows.flow, [slug, default-source-authentication]]
+      enrollment_flow: !Find [authentik_flows.flow, [slug, default-source-enrollment]]
+      user_property_mappings:
+        - !KeyOf google-verified-email
+
+  - model: authentik_sources_oauth.oauthsource
+    id: github-source
+    identifiers:
+      slug: github
+    attrs:
+      name: GitHub
+      provider_type: github
+      enabled: !Condition [AND, !Env GITHUB_CLIENT_ID, !Env GITHUB_CLIENT_SECRET]
+      consumer_key: !Env [GITHUB_CLIENT_ID, unset]
+      consumer_secret: !Env [GITHUB_CLIENT_SECRET, unset]
+      user_matching_mode: email_deny
+      authentication_flow: !Find [authentik_flows.flow, [slug, default-source-authentication]]
+      enrollment_flow: !Find [authentik_flows.flow, [slug, default-source-enrollment]]
+      user_property_mappings:
+        - !KeyOf github-verified-email
+
+  - model: authentik_stages_authenticator_validate.authenticatorvalidatestage
+    id: convstack-passkey-validation
+    identifiers:
+      name: convstack-passkey-validation
+    attrs:
+      device_classes:
+        - webauthn
+      webauthn_user_verification: required
+
+  - model: authentik_stages_identification.identificationstage
+    identifiers:
+      name: default-authentication-identification
+    attrs:
+      sources:
+        - !KeyOf discord-source
+        - !KeyOf google-source
+        - !KeyOf github-source
+      webauthn_stage: !KeyOf convstack-passkey-validation
+
+  - model: authentik_stages_user_login.userloginstage
+    identifiers:
+      name: default-authentication-login
+    attrs:
+      remember_me_offset: days=30
+
+  - model: authentik_stages_user_login.userloginstage
+    identifiers:
+      name: default-source-authentication-login
+    attrs:
+      remember_me_offset: days=30
+
+  - model: authentik_stages_user_login.userloginstage
+    identifiers:
+      name: default-source-enrollment-login
+    attrs:
+      remember_me_offset: days=30
+
+  - model: authentik_stages_user_write.userwritestage
+    identifiers:
+      name: default-source-enrollment-write
+    attrs:
+      user_type: internal
+
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Brand
+      required: false
+
+  - model: authentik_brands.brand
+    identifiers:
+      domain: authentik-default
+    permissions:
+      - permission: authentik_brands.view_brand
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_brands.change_brand
+        role: !KeyOf lanyard-service-role
+    attrs:
+      branding_title: ConvStack
+      attributes:
+        settings:
+          theme:
+            base: dark
+      # Restyles Authentik's own components on every screen a visitor passes.
+      # The block between the two markers is the part an admin's branding
+      # replaces; it holds nothing but variables. See README, Look
+      branding_custom_css: |
+        /* convstack:branding */
+        html {
+          --cs-name: "ConvStack";
+          --cs-button: #466de3;
+          --cs-button-hover: #3f62cc;
+          --cs-link-dark: #4f7bff;
+          --cs-link-light: #466de3;
+        }
+        /* /convstack:branding */
+
+        /* Every rule below reaches only the sign-in screens: Authentik adopts this
+           sheet into every component on every page, admin and user interfaces
+           included, so a rule on a generic element is scoped to the components the
+           flow executor is made of (its stages carry part="challenge", its card
+           part="flow-card") or to a page that has the executor in it */
+
+        html {
+          --cs-canvas: #0b0d14;
+          --cs-panel: #0f1218;
+          --cs-field: #0b0d14;
+          --cs-border: #1c2130;
+          --cs-border-strong: #2a3148;
+          --cs-field-border: #5f6a89;
+          --cs-text: #e6e8ef;
+          --cs-muted: #8a93a8;
+          --cs-link: var(--cs-link-dark);
+          --cs-danger: #ff8a8a;
+          --cs-shade: rgba(79, 123, 255, 0.14);
+          --cs-font: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        }
+        html[data-theme="light"] {
+          --cs-canvas: #fafbfc;
+          --cs-panel: #ffffff;
+          --cs-field: #ffffff;
+          --cs-border: #e4e8ef;
+          --cs-border-strong: #c5cbd6;
+          --cs-field-border: #7c869a;
+          --cs-text: #111827;
+          --cs-muted: #4b5563;
+          --cs-link: var(--cs-link-light);
+          --cs-danger: #b42318;
+          --cs-shade: rgba(79, 123, 255, 0.1);
+        }
+
+        ak-flow-executor {
+          --ak-c-login__main--BackgroundColor: var(--cs-panel);
+          --ak-c-login__main--Color: var(--cs-text);
+          --ak-c-login__main--BoxShadow: none;
+          --ak-c-login__content-BoxShadow: none;
+          --ak-c-login--BackgroundColorOverlay: transparent;
+          --ak-c-login__footer--Color: var(--cs-muted);
+          --ak-c-locale-select--Color: var(--cs-muted);
+          --ak-c-locale-select--label--Color: var(--cs-muted);
+          --pf-global--primary-color--100: var(--cs-button);
+          --pf-global--primary-color--200: var(--cs-button-hover);
+          --pf-global--link--Color: var(--cs-link);
+          --pf-global--link--Color--hover: var(--cs-link);
+          --pf-global--Color--100: var(--cs-text);
+          --pf-global--Color--200: var(--cs-muted);
+          --pf-global--danger-color--100: var(--cs-danger);
+          --pf-global--BorderColor--100: var(--cs-border-strong);
+          --pf-global--BackgroundColor--100: var(--cs-panel);
+          --pf-global--FontFamily--sans-serif: var(--cs-font);
+          --pf-global--FontFamily--heading--sans-serif: var(--cs-font);
+          --pf-global--LineHeight--md: 1.6;
+        }
+
+        body:has(ak-flow-executor) {
+          background: var(--cs-canvas);
+          color: var(--cs-text);
+          font-family: var(--cs-font);
+        }
+        /* the picture an admin uploaded, or a quiet drawing in the palette */
+        body:has(ak-flow-executor)::before {
+          background-image: var(
+            --cs-image,
+            radial-gradient(60rem 40rem at 78% 18%, var(--cs-shade), transparent 60%),
+            radial-gradient(48rem 36rem at 96% 92%, var(--cs-shade), transparent 62%),
+            linear-gradient(160deg, var(--cs-panel), var(--cs-canvas))
+          ) !important;
+          filter: none !important;
+        }
+        /* Authentik's own point where the split layout folds into one column */
+        @media not ((min-width: 70rem) and (min-height: 17.5rem)) {
+          body:has(ak-flow-executor) {
+            background: var(--cs-panel);
+          }
+          body:has(ak-flow-executor)::before {
+            display: none;
+          }
+        }
+
+        /* the panel is one surface from top to bottom, with one edge towards the picture */
+        .pf-c-login[data-layout^="sidebar"]::before {
+          box-shadow: none !important;
+          background: var(--cs-panel) !important;
+          opacity: 1 !important;
+        }
+        .pf-c-login[data-layout^="sidebar_left"]::before {
+          border-inline-end: 1px solid var(--cs-border);
+        }
+        .pf-c-login[data-layout^="sidebar_right"]::before {
+          border-inline-start: 1px solid var(--cs-border);
+        }
+        .pf-c-login[data-layout^="sidebar"] .pf-c-login__main {
+          background: transparent !important;
+          justify-content: center !important;
+        }
+        .pf-c-login[data-layout="stacked"] .pf-c-login__main,
+        .pf-c-login[data-layout^="content"] .pf-c-login__main {
+          border: 1px solid var(--cs-border);
+          border-radius: 12px;
+        }
+
+        /* Authentik's "Powered by" entry goes; a convention's own footer links stay,
+           and the footer itself goes when none are left */
+        ak-brand-links li[data-track-name="start"] {
+          display: none;
+        }
+        ak-flow-executor:not(:has(ak-brand-links li:not([data-track-name="start"])))::part(footer) {
+          display: none;
+        }
+        .pf-c-login__main-header.pf-c-brand img {
+          display: var(--cs-logo, none) !important;
+          max-height: 40px;
+        }
+        .pf-c-login__main-header.pf-c-brand {
+          justify-content: flex-start !important;
+          padding: 40px var(--pf-c-login__main-header--PaddingRight) 8px
+            var(--pf-c-login__main-header--PaddingLeft) !important;
+        }
+        .pf-c-login__main-header.pf-c-brand::before {
+          content: var(--cs-name);
+          display: var(--cs-wordmark, block);
+          font-size: 18px;
+          font-weight: 600;
+          line-height: 1.25;
+          color: var(--cs-text);
+        }
+        .pf-c-login__main-header.pf-c-brand::after {
+          content: "";
+          display: var(--cs-logo-light-display, none);
+          flex: none;
+          width: 200px;
+          height: 40px;
+          background: var(--cs-logo-light, none) left center / contain no-repeat;
+        }
+
+        :host(ak-flow-card) h1.pf-c-title {
+          font-size: 24px !important;
+          line-height: 1.25 !important;
+          font-weight: 600 !important;
+          color: var(--cs-text);
+        }
+        :host(ak-flow-card) h1.pf-c-title::after {
+          content: var(--cs-tagline, none);
+          display: block;
+          margin-top: 8px;
+          font-size: 16px;
+          line-height: 1.6;
+          font-weight: 400;
+          color: var(--cs-muted);
+        }
+
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-form__label .pf-c-form__label-text {
+          font-size: 14px !important;
+          font-weight: 500 !important;
+          color: var(--cs-muted) !important;
+        }
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-form__label {
+          display: block;
+          margin-bottom: 6px;
+        }
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-form-control,
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-form-control[type] {
+          min-height: 44px;
+          padding: 10px 12px;
+          background: var(--cs-field) !important;
+          border: 1px solid var(--cs-field-border) !important;
+          border-radius: 8px !important;
+          color: var(--cs-text) !important;
+          font-size: 16px;
+        }
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-form-control::placeholder {
+          color: var(--cs-muted);
+          font-style: normal;
+          opacity: 1;
+        }
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-form-control:hover {
+          border-color: var(--cs-muted) !important;
+        }
+
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-button {
+          min-height: 44px;
+          border-radius: 8px !important;
+          font-weight: 600;
+        }
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-button::after {
+          border-radius: 8px !important;
+        }
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-button.pf-m-primary {
+          background-color: var(--cs-button) !important;
+          color: #ffffff !important;
+        }
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-button.pf-m-primary:hover {
+          background-color: var(--cs-button-hover) !important;
+        }
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-button.pf-m-primary:active {
+          filter: brightness(0.92);
+        }
+
+        :host(:is([part="challenge"], ak-flow-card)) a {
+          color: var(--cs-link);
+          text-underline-offset: 2px;
+        }
+        :host(:is([part="challenge"], ak-flow-card)) a:hover {
+          text-decoration: underline;
+        }
+
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-form-control:focus-visible,
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-button:focus-visible,
+        :host(:is([part="challenge"], ak-flow-card)) a:focus-visible,
+        :host(ak-locale-select) select:focus-visible {
+          outline: 2px solid var(--cs-link) !important;
+          outline-offset: 2px !important;
+        }
+
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-form__helper-text.pf-m-error,
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-form__helper-text .pf-m-error {
+          color: var(--cs-danger) !important;
+        }
+
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-alert.pf-m-inline {
+          background: var(--cs-field) !important;
+          border: 1px solid var(--cs-field-border) !important;
+          border-radius: 8px;
+          box-shadow: none !important;
+        }
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-alert.pf-m-inline.pf-m-danger {
+          border-color: var(--cs-danger) !important;
+        }
+        :host(:is([part="challenge"], ak-flow-card)) .pf-c-alert__title {
+          color: var(--cs-text) !important;
+        }
+
+        /* "Log in to continue to <application>" repeats the name the wordmark already
+           shows, and names the application, not what an admin called the product. The
+           reset screen's hint is the same element, so the flow decides */
+        ak-flow-executor[slug="default-authentication-flow"] {
+          --cs-application-line: none;
+        }
+        :host(:is([part="challenge"], ak-flow-card)) form.pf-c-form > p:first-child {
+          display: var(--cs-application-line, block);
+        }
+
+  # the same layout on every screen a visitor passes. The name is on each of
+  # them as the wordmark, so the headings leave it out
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-authentication-flow
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      title: Sign in
+      layout: sidebar_left
+
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-source-authentication
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      title: Sign in
+      layout: sidebar_left
+
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-source-enrollment
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      title: Finish your account
+      layout: sidebar_left
+
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-source-pre-authentication
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      layout: sidebar_left
+
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-provider-authorization-explicit-consent
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      title: Confirm sign-in
+      layout: sidebar_left
+
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-provider-authorization-implicit-consent
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      title: Confirm sign-in
+      layout: sidebar_left
+
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-invalidation-flow
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      title: Signing out
+      layout: sidebar_left
+
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-provider-invalidation-flow
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      layout: sidebar_left
+
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-password-change
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      layout: sidebar_left
+
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-authenticator-static-setup
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      layout: sidebar_left
+
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-authenticator-totp-setup
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      layout: sidebar_left
+
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-authenticator-webauthn-setup
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      layout: sidebar_left
+
+  # sign-up and reset work by mailing a link, so both are closed until a mail
+  # host is set. Written as allow or deny from .env on every apply
+  - model: authentik_policies_expression.expressionpolicy
+    id: convstack-mail-configured
+    identifiers:
+      name: convstack-mail-configured
+    attrs:
+      expression: !If [!Env AUTHENTIK_EMAIL__HOST, "return True", "return False"]
+
+  - model: authentik_policies_password.passwordpolicy
+    id: convstack-password-policy
+    identifiers:
+      name: convstack-password-policy
+    attrs:
+      password_field: password
+      length_min: 10
+      check_static_rules: true
+      check_zxcvbn: true
+      # fails at this score or below, so a password needs 2 or more
+      zxcvbn_score_threshold: 1
+      error_message: Use at least 10 characters.
+
+  - model: authentik_policies_expression.expressionpolicy
+    id: convstack-enrollment-email
+    identifiers:
+      name: convstack-enrollment-email
+    attrs:
+      expression: |
+        from authentik.core.models import User
+
+        data = request.context["prompt_data"]
+        email = data["email"].strip()
+        holders = list(User.objects.filter(email__iexact=email) | User.objects.filter(username__iexact=email))
+        for holder in holders:
+            unconfirmed = (
+                not holder.is_active
+                and holder.last_login is None
+                and holder.attributes.get("convstack_pending")
+            )
+            if not unconfirmed:
+                ak_message("That email already has an account. Sign in or reset your password.")
+                return False
+        # an earlier sign-up nobody confirmed must not lock the address
+        for holder in holders:
+            holder.delete()
+        data["email"] = email
+        data["username"] = email
+        return True
+
+  - model: authentik_stages_prompt.prompt
+    id: convstack-field-name
+    identifiers:
+      name: convstack-field-name
+    attrs:
+      field_key: name
+      label: Name
+      type: text
+      required: true
+      placeholder: Name
+      order: 0
+
+  - model: authentik_stages_prompt.prompt
+    id: convstack-field-email
+    identifiers:
+      name: convstack-field-email
+    attrs:
+      field_key: email
+      label: Email
+      type: email
+      required: true
+      placeholder: Email
+      order: 1
+
+  # a hidden field's value is its placeholder, set by the server whatever the
+  # browser sends
+  - model: authentik_stages_prompt.prompt
+    id: convstack-field-pending
+    identifiers:
+      name: convstack-field-pending
+    attrs:
+      field_key: attributes_convstack_pending
+      label: Pending
+      type: hidden
+      required: false
+      placeholder: "true"
+      order: 2
+
+  - model: authentik_stages_prompt.prompt
+    id: convstack-field-password
+    identifiers:
+      name: convstack-field-password
+    attrs:
+      field_key: password
+      label: Password
+      type: password
+      required: true
+      placeholder: Password
+      order: 0
+
+  - model: authentik_stages_prompt.prompt
+    id: convstack-field-password-repeat
+    identifiers:
+      name: convstack-field-password-repeat
+    attrs:
+      field_key: password_repeat
+      label: Password (repeat)
+      type: password
+      required: true
+      placeholder: Password (repeat)
+      order: 1
+
+  - model: authentik_stages_prompt.promptstage
+    id: convstack-enrollment-details
+    identifiers:
+      name: convstack-enrollment-details
+    attrs:
+      fields:
+        - !KeyOf convstack-field-name
+        - !KeyOf convstack-field-email
+        - !KeyOf convstack-field-pending
+      validation_policies:
+        - !KeyOf convstack-enrollment-email
+
+  - model: authentik_stages_user_write.userwritestage
+    id: convstack-enrollment-create
+    identifiers:
+      name: convstack-enrollment-create
+    attrs:
+      create_users_as_inactive: true
+      user_creation_mode: always_create
+      user_type: internal
+
+  - model: authentik_stages_email.emailstage
+    id: convstack-enrollment-confirm
+    identifiers:
+      name: convstack-enrollment-confirm
+    permissions:
+      - permission: authentik_stages_email.view_emailstage
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_stages_email.change_emailstage
+        role: !KeyOf lanyard-service-role
+    attrs:
+      use_global_settings: true
+      # ours, from templates/ in this directory; Authentik's own name Authentik
+      template: convstack/confirm.html
+      subject: Confirm your ConvStack account
+      token_expiry: minutes=30
+      # convstack-account-deactivated confirms the sign-up, see there
+      activate_user_on_success: false
+
+  # the password is chosen after the mailed link, so only someone who can read
+  # the mailbox ever sets it
+  - model: authentik_stages_prompt.promptstage
+    id: convstack-set-password
+    identifiers:
+      name: convstack-set-password
+    attrs:
+      fields:
+        - !KeyOf convstack-field-password
+        - !KeyOf convstack-field-password-repeat
+      validation_policies:
+        - !KeyOf convstack-password-policy
+
+  - model: authentik_stages_user_write.userwritestage
+    id: convstack-write-password
+    identifiers:
+      name: convstack-write-password
+    attrs:
+      user_creation_mode: never_create
+
+  - model: authentik_stages_user_login.userloginstage
+    id: convstack-self-service-login
+    identifiers:
+      name: convstack-self-service-login
+    attrs:
+      remember_me_offset: days=30
+
+  - model: authentik_flows.flow
+    id: convstack-enrollment-flow
+    identifiers:
+      slug: convstack-enrollment
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      name: ConvStack sign-up
+      title: Create your account
+      layout: sidebar_left
+      designation: enrollment
+      authentication: require_unauthenticated
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf convstack-enrollment-flow
+      order: 0
+    attrs:
+      policy: !KeyOf convstack-mail-configured
+      enabled: true
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf convstack-enrollment-flow
+      stage: !KeyOf convstack-enrollment-details
+      order: 10
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf convstack-enrollment-flow
+      stage: !KeyOf convstack-enrollment-create
+      order: 20
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf convstack-enrollment-flow
+      stage: !KeyOf convstack-enrollment-confirm
+      order: 30
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf convstack-enrollment-flow
+      stage: !KeyOf convstack-set-password
+      order: 40
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf convstack-enrollment-flow
+      stage: !KeyOf convstack-write-password
+      order: 50
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf convstack-enrollment-flow
+      stage: !KeyOf convstack-self-service-login
+      order: 100
+
+  - model: authentik_stages_identification.identificationstage
+    id: convstack-recovery-identification
+    identifiers:
+      name: convstack-recovery-identification
+    attrs:
+      user_fields:
+        - email
+      # the same screen whether or not the address has an account
+      pretend_user_exists: true
+
+  - model: authentik_stages_email.emailstage
+    id: convstack-recovery-email
+    identifiers:
+      name: convstack-recovery-email
+    permissions:
+      - permission: authentik_stages_email.view_emailstage
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_stages_email.change_emailstage
+        role: !KeyOf lanyard-service-role
+    attrs:
+      use_global_settings: true
+      template: convstack/reset.html
+      subject: Reset your ConvStack password
+      token_expiry: minutes=30
+      # a reset link must not switch an account back on that an admin
+      # deactivated; convstack-account-deactivated confirms a sign-up instead
+      activate_user_on_success: false
+      recovery_max_attempts: 5
+      recovery_cache_timeout: minutes=5
+
+  - model: authentik_policies_expression.expressionpolicy
+    id: convstack-recovery-skip-if-restored
+    identifiers:
+      name: convstack-recovery-skip-if-restored
+    attrs:
+      expression: |
+        return bool(request.context.get('is_restored', True))
+
+  - model: authentik_flows.flow
+    id: convstack-recovery-flow
+    identifiers:
+      slug: convstack-recovery
+    permissions:
+      - permission: authentik_flows.view_flow
+        role: !KeyOf lanyard-service-role
+      - permission: authentik_flows.change_flow
+        role: !KeyOf lanyard-service-role
+    attrs:
+      name: ConvStack password reset
+      title: Reset your password
+      layout: sidebar_left
+      designation: recovery
+      authentication: require_unauthenticated
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf convstack-recovery-flow
+      order: 0
+    attrs:
+      policy: !KeyOf convstack-mail-configured
+      enabled: true
+
+  - model: authentik_flows.flowstagebinding
+    id: convstack-recovery-binding-identification
+    identifiers:
+      target: !KeyOf convstack-recovery-flow
+      stage: !KeyOf convstack-recovery-identification
+      order: 10
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: true
+      policy_engine_mode: any
+      invalid_response_action: retry
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf convstack-recovery-flow
+      stage: !KeyOf convstack-recovery-email
+      order: 20
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: true
+      policy_engine_mode: any
+      invalid_response_action: retry
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf convstack-recovery-flow
+      stage: !KeyOf convstack-set-password
+      order: 30
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf convstack-recovery-flow
+      stage: !KeyOf convstack-write-password
+      order: 40
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf convstack-recovery-flow
+      stage: !KeyOf convstack-self-service-login
+      order: 100
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      policy: !KeyOf convstack-recovery-skip-if-restored
+      target: !KeyOf convstack-recovery-binding-identification
+      order: 0
+    attrs:
+      negate: false
+      enabled: true
+      timeout: 30
+
+  # always part of both flows; this policy, written from .env on every apply,
+  # decides whether the step runs
+  - model: authentik_policies_expression.expressionpolicy
+    id: convstack-captcha-configured
+    identifiers:
+      name: convstack-captcha-configured
+    attrs:
+      expression: !If [!Condition [AND, !Env TURNSTILE_SITE_KEY, !Env TURNSTILE_SECRET_KEY], "return True", "return False"]
+
+  - model: authentik_stages_captcha.captchastage
+    id: convstack-captcha
+    identifiers:
+      name: convstack-captcha
+    attrs:
+      # "unset" only keeps Authentik's required key fields non-blank
+      public_key: !Env [TURNSTILE_SITE_KEY, unset]
+      private_key: !Env [TURNSTILE_SECRET_KEY, unset]
+      js_url: https://challenges.cloudflare.com/turnstile/v0/api.js
+      api_url: https://challenges.cloudflare.com/turnstile/v0/siteverify
+      interactive: true
+
+  - model: authentik_flows.flowstagebinding
+    id: convstack-enrollment-binding-captcha
+    identifiers:
+      target: !KeyOf convstack-enrollment-flow
+      stage: !KeyOf convstack-captcha
+      order: 5
+
+  - model: authentik_flows.flowstagebinding
+    id: convstack-recovery-binding-captcha
+    identifiers:
+      target: !KeyOf convstack-recovery-flow
+      stage: !KeyOf convstack-captcha
+      order: 5
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      policy: !KeyOf convstack-captcha-configured
+      target: !KeyOf convstack-enrollment-binding-captcha
+      order: 0
+    attrs:
+      enabled: true
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      policy: !KeyOf convstack-captcha-configured
+      target: !KeyOf convstack-recovery-binding-captcha
+      order: 0
+    attrs:
+      enabled: true
+
+  # Authentik tests a link's time and single use when its Continue page loads,
+  # not when Continue is pressed, so a page left open, or a second browser that
+  # loaded it in time, would still get through. The first browser to continue
+  # claims the link
+  - model: authentik_policies_expression.expressionpolicy
+    id: convstack-link-spent
+    identifiers:
+      name: convstack-link-spent
+    attrs:
+      expression: |
+        from django.core.cache import cache
+        from django.utils.timezone import now
+
+        link = request.context["is_restored"]
+        if link.expires < now():
+            return True
+        browser = request.http_request.session.session_key
+        # not link.pk, which is gone once the Continue page deleted the link
+        claim = f"convstack-link-{link.identifier}"
+        if cache.get(claim) is None:
+            # add() never replaces a claim that is already there
+            cache.add(claim, browser, 3600)
+        return cache.get(claim) != browser
+
+  - model: authentik_stages_deny.denystage
+    id: convstack-link-refused
+    identifiers:
+      name: convstack-link-refused
+    attrs:
+      deny_message: This link has expired or was already used. Request a new one.
+
+  - model: authentik_flows.flowstagebinding
+    id: convstack-enrollment-binding-link
+    identifiers:
+      target: !KeyOf convstack-enrollment-flow
+      stage: !KeyOf convstack-link-refused
+      order: 33
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      policy: !KeyOf convstack-link-spent
+      target: !KeyOf convstack-enrollment-binding-link
+      order: 0
+    attrs:
+      enabled: true
+      failure_result: true
+
+  - model: authentik_flows.flowstagebinding
+    id: convstack-recovery-binding-link
+    identifiers:
+      target: !KeyOf convstack-recovery-flow
+      stage: !KeyOf convstack-link-refused
+      order: 23
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      policy: !KeyOf convstack-link-spent
+      target: !KeyOf convstack-recovery-binding-link
+      order: 0
+    attrs:
+      enabled: true
+      failure_result: true
+
+  # runs once a mailed link was followed, and again before a password is
+  # saved. A flow keeps the account as it was when the mail went out and saves
+  # that copy back, and a link opened in a browser that already filled in a
+  # sign-up form takes over that form's answers. So this reads the account
+  # again and leaves nothing to save but the password
+  - model: authentik_policies_expression.expressionpolicy
+    id: convstack-account-deactivated
+    identifiers:
+      name: convstack-account-deactivated
+    attrs:
+      expression: |
+        from authentik.core.models import User
+
+        current = User.objects.filter(pk=request.user.pk).first()
+        if current is None:
+            return True
+        if current.attributes.pop("convstack_pending", None):
+            if not current.is_active and current.last_login is None:
+                # the link confirmed the address. From here on this is a real
+                # account, and being inactive means an admin deactivated it
+                current.is_active = True
+            current.save(update_fields=["attributes", "is_active"])
+        request.context["flow_plan"].context["pending_user"] = current
+        answers = request.context.get("prompt_data", {})
+        for key in list(answers):
+            if key not in ("password", "password_repeat"):
+                del answers[key]
+        return not current.is_active
+
+  - model: authentik_stages_deny.denystage
+    id: convstack-deactivated
+    identifiers:
+      name: convstack-deactivated
+    attrs:
+      deny_message: This account is deactivated.
+
+  - model: authentik_flows.flowstagebinding
+    id: convstack-enrollment-binding-confirmed
+    identifiers:
+      target: !KeyOf convstack-enrollment-flow
+      stage: !KeyOf convstack-deactivated
+      order: 35
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      policy: !KeyOf convstack-account-deactivated
+      target: !KeyOf convstack-enrollment-binding-confirmed
+      order: 0
+    attrs:
+      enabled: true
+      # if the check itself breaks, end the flow
+      failure_result: true
+
+  - model: authentik_flows.flowstagebinding
+    id: convstack-enrollment-binding-before-write
+    identifiers:
+      target: !KeyOf convstack-enrollment-flow
+      stage: !KeyOf convstack-deactivated
+      order: 45
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      policy: !KeyOf convstack-account-deactivated
+      target: !KeyOf convstack-enrollment-binding-before-write
+      order: 0
+    attrs:
+      enabled: true
+      failure_result: true
+
+  - model: authentik_flows.flowstagebinding
+    id: convstack-recovery-binding-confirmed
+    identifiers:
+      target: !KeyOf convstack-recovery-flow
+      stage: !KeyOf convstack-deactivated
+      order: 25
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      policy: !KeyOf convstack-account-deactivated
+      target: !KeyOf convstack-recovery-binding-confirmed
+      order: 0
+    attrs:
+      enabled: true
+      failure_result: true
+
+  # a mailed link stands in for the password, not for the second factor
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf convstack-recovery-flow
+      stage: !Find [authentik_stages_authenticator_validate.authenticatorvalidatestage, [name, default-authentication-mfa-validation]]
+      order: 27
+
+  - model: authentik_flows.flowstagebinding
+    id: convstack-recovery-binding-before-write
+    identifiers:
+      target: !KeyOf convstack-recovery-flow
+      stage: !KeyOf convstack-deactivated
+      order: 35
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      policy: !KeyOf convstack-account-deactivated
+      target: !KeyOf convstack-recovery-binding-before-write
+      order: 0
+    attrs:
+      enabled: true
+      failure_result: true
+
+  # the links follow the mail host like the flows do. A second entry for the
+  # stage, because the flows above have to exist before it can point at them
+  - model: authentik_stages_identification.identificationstage
+    identifiers:
+      name: default-authentication-identification
+    attrs:
+      # Authentik's check of this stage wants its login fields in every entry
+      user_fields:
+        - email
+        - username
+      enrollment_flow: !If [!Env AUTHENTIK_EMAIL__HOST, !KeyOf convstack-enrollment-flow, null]
+      recovery_flow: !If [!Env AUTHENTIK_EMAIL__HOST, !KeyOf convstack-recovery-flow, null]
